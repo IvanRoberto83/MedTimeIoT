@@ -4,8 +4,8 @@
 #include <DFRobotDFPlayerMini.h>
 
 // WiFi
-const char *ssid = "FINS";
-const char *password = "30282215";
+const char *ssid = ""; //nama Wi-Fi
+const char *password = ""; //password
 
 // MQTT Broker
 const char *mqtt_broker = "broker.emqx.io";
