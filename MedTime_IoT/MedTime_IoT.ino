@@ -1,6 +1,12 @@
 #include <WiFi.h>
 #include <PubSubClient.h>
-#include <DFRobotDFPlayerMini.h>
+#include <ArduinoJson.h>
+
+// Audio libraries
+#include "AudioFileSourceHTTPStream.h"
+#include "AudioGeneratorMP3.h"
+#include "AudioOutputI2S.h"
+#include "AudioFileSourceBuffer.h"
 
 // WiFi
 const char *ssid = "FINS";
@@ -15,33 +21,26 @@ const int mqtt_port = 1883;
 
 // Pin
 #define LED_PIN 14
-#define DF_TX 17   // TX ke RX DFPlayer
-#define DF_RX 16   // RX ke TX DFPlayer
 
 WiFiClient espClient;
 PubSubClient client(espClient);
 
-// DFPlayer
-HardwareSerial dfSerial(1); 
-DFRobotDFPlayerMini dfPlayer;
+// Audio objects
+AudioGeneratorMP3 *mp3;
+AudioFileSourceHTTPStream *file;
+AudioFileSourceBuffer *buff;
+AudioOutputI2S *out;
 
 bool ledState = false;
+String lastUrl = "";   // simpan URL terakhir
+bool loopActive = false; // flag looping
 
 void setup() {
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
   Serial.begin(115200);
 
-  // Serial DFPlayer di UART1
-  dfSerial.begin(9600, SERIAL_8N1, DF_RX, DF_TX);
-  if (!dfPlayer.begin(dfSerial)) {
-    Serial.println("❌ Gagal inisialisasi DFPlayer!");
-  } else {
-    Serial.println("✅ DFPlayer siap!");
-    dfPlayer.volume(15);
-  }
-
-  // Koneksi WiFi
+  // WiFi connect
   WiFi.begin(ssid, password);
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
@@ -49,44 +48,84 @@ void setup() {
   }
   Serial.println("✅ Connected to WiFi!");
 
-  // Koneksi MQTT
+  // MQTT
   client.setServer(mqtt_broker, mqtt_port);
   client.setCallback(callback);
+  client.setBufferSize(1024);   // ✅ buffer besar buat JSON
+
   while (!client.connected()) {
     String client_id = "esp32-client-" + String(WiFi.macAddress());
     if (client.connect(client_id.c_str(), mqtt_username, mqtt_password)) {
       Serial.println("✅ Connected to MQTT Broker!");
     } else {
       Serial.print("❌ Failed, rc=");
-      Serial.print(client.state());
+      Serial.println(client.state());
       delay(2000);
     }
   }
-
   client.publish(topic, "📨 ESP Ready & Subscribed!");
   client.subscribe(topic);
+
+  // Init audio
+  out = new AudioOutputI2S();
+  out->SetPinout(27, 26, 25); // BCLK, LRCLK, DIN
+  out->SetGain(0.5);          // volume
+  mp3 = new AudioGeneratorMP3();
 }
 
-void callback(char *topic, byte *payload, unsigned int length) {
-  String msg = "";
-  for (int i = 0; i < length; i++) msg += (char)payload[i];
+// // Tambah ini
+// void safeDeleteAudio() {
+//   if (mp3->isRunning()) mp3->stop();
+//   if (buff) { delete buff; buff = nullptr; }
+//   if (file) { delete file; file = nullptr; }
+// }
+
+// Callback MQTT
+void callback(char* topic, byte* payload, unsigned int length) {
+  String msg;
+  for (int i = 0; i < length; i++) {
+    msg += (char)payload[i];
+  }
+  Serial.println("📩 Pesan MQTT: " + msg);
 
   if (String(topic) == "pkm/alarm") {
-    if (msg.indexOf("\"command\":\"ON\"") >= 0) {
-      ledState = true;
+    StaticJsonDocument<1024> doc;
+    DeserializationError error = deserializeJson(doc, msg);
+
+    if (error) {
+      Serial.print("❌ JSON parse gagal: ");
+      Serial.println(error.f_str());
+      return;
+    }
+
+    const char* command = doc["command"];
+    const char* url = doc["mp3Url"];
+
+    if (command && String(command) == "ON") {
       digitalWrite(LED_PIN, HIGH);
       Serial.println("💡 LED ON");
 
-      int start = msg.indexOf("\"mp3\":\"") + 7;
-      int end = msg.indexOf("\"", start);
-      String mp3File = msg.substring(start, end);
+      if (url) {
+        lastUrl = String(url);   // simpan URL
+        loopActive = true;       // aktifkan loop
 
-      dfPlayer.play(mp3File.toInt());
-    } 
-    else if (msg.indexOf("\"command\":\"OFF\"") >= 0) {
-      ledState = false;
+        // safeDeleteAudio();   // ✅ bersihin dulu
+
+        if (mp3->isRunning()) mp3->stop();
+        file = new AudioFileSourceHTTPStream(lastUrl.c_str());
+        buff = new AudioFileSourceBuffer(file, 2048);
+        mp3->begin(buff, out);
+        Serial.println("▶️ MP3 started (looping ON)");
+      }
+    }
+
+    if (command && String(command) == "OFF") {
       digitalWrite(LED_PIN, LOW);
-      dfPlayer.stop();
+      Serial.println("💡 LED OFF");
+
+      loopActive = false;  // hentikan loop
+      // safeDeleteAudio();   // ✅ bersihin dulu
+      if (mp3->isRunning()) mp3->stop();
     }
   }
 }
@@ -94,10 +133,18 @@ void callback(char *topic, byte *payload, unsigned int length) {
 void loop() {
   client.loop();
 
-  if (ledState && dfPlayer.available()) {
-    uint8_t type = dfPlayer.readType();
-    if (type == DFPlayerPlayFinished) {
-      dfPlayer.play(1);
+  if (mp3->isRunning()) {
+    if (!mp3->loop()) {
+      mp3->stop();
+      Serial.println("✅ Playback finished");
+
+      // Restart lagi kalau loop aktif
+      if (loopActive && lastUrl != "") {
+        Serial.println("🔁 Restarting playback...");
+        file = new AudioFileSourceHTTPStream(lastUrl.c_str());
+        buff = new AudioFileSourceBuffer(file, 2048);
+        mp3->begin(buff, out);
+      }
     }
   }
 }

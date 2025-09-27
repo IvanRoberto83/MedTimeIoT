@@ -8,11 +8,20 @@
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "description": "",
   "dependencies": {
+    "express": "^5.1.0",
     "firebase-admin": "^13.4.0",
     "fs": "^0.0.1-security",
     "google-tts-api": "^2.0.2",
     "mqtt": "^5.14.0"
-  }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/IvanRoberto83/MedTimeIoT.git"
+  },
+  "bugs": {
+    "url": "https://github.com/IvanRoberto83/MedTimeIoT/issues"
+  },
+  "homepage": "https://github.com/IvanRoberto83/MedTimeIoT#readme",
+  "description": ""
 }
