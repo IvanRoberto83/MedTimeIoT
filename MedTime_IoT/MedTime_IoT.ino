@@ -7,6 +7,7 @@
 #include "AudioGeneratorMP3.h"
 #include "AudioOutputI2S.h"
 #include "AudioFileSourceBuffer.h"
+#include "driver/adc.h"
 
 // WiFi
 const char *ssid = "FINS";
@@ -21,24 +22,36 @@ const int mqtt_port = 1883;
 
 // Pin
 #define LED_PIN 14
+#define POT_PIN 32
 
 WiFiClient espClient;
 PubSubClient client(espClient);
 
 // Audio objects
 AudioGeneratorMP3 *mp3;
-AudioFileSourceHTTPStream *file;
-AudioFileSourceBuffer *buff;
+AudioFileSourceHTTPStream *file = nullptr;
+AudioFileSourceBuffer *buff = nullptr;
 AudioOutputI2S *out;
 
-bool ledState = false;
 String lastUrl = "";   // simpan URL terakhir
 bool loopActive = false; // flag looping
 
+// ==== Safe delete fungsi
+void safeDeleteAudio() {
+  if (mp3->isRunning()) mp3->stop();
+  if (buff) { delete buff; buff = nullptr; }
+  if (file) { delete file; file = nullptr; }
+}
+
 void setup() {
   pinMode(LED_PIN, OUTPUT);
+  pinMode(POT_PIN, INPUT);
   digitalWrite(LED_PIN, LOW);
   Serial.begin(115200);
+
+  // ADC NG driver setup
+  adc1_config_width(ADC_WIDTH_BIT_12);
+  adc1_config_channel_atten(ADC1_CHANNEL_4, ADC_ATTEN_DB_11); // pin 32
 
   // WiFi connect
   WiFi.begin(ssid, password);
@@ -51,7 +64,7 @@ void setup() {
   // MQTT
   client.setServer(mqtt_broker, mqtt_port);
   client.setCallback(callback);
-  client.setBufferSize(1024);   // ✅ buffer besar buat JSON
+  client.setBufferSize(1024);   // buffer besar buat JSON
 
   while (!client.connected()) {
     String client_id = "esp32-client-" + String(WiFi.macAddress());
@@ -69,82 +82,77 @@ void setup() {
   // Init audio
   out = new AudioOutputI2S();
   out->SetPinout(27, 26, 25); // BCLK, LRCLK, DIN
-  out->SetGain(0.5);          // volume
+  out->SetGain(0.5);          // default volume
   mp3 = new AudioGeneratorMP3();
 }
-
-// // Tambah ini
-// void safeDeleteAudio() {
-//   if (mp3->isRunning()) mp3->stop();
-//   if (buff) { delete buff; buff = nullptr; }
-//   if (file) { delete file; file = nullptr; }
-// }
 
 // Callback MQTT
 void callback(char* topic, byte* payload, unsigned int length) {
   String msg;
-  for (int i = 0; i < length; i++) {
-    msg += (char)payload[i];
-  }
+  for (int i = 0; i < length; i++) msg += (char)payload[i];
   Serial.println("📩 Pesan MQTT: " + msg);
 
-  if (String(topic) == "pkm/alarm") {
-    StaticJsonDocument<1024> doc;
-    DeserializationError error = deserializeJson(doc, msg);
+  if (String(topic) != "pkm/alarm") return;
 
-    if (error) {
-      Serial.print("❌ JSON parse gagal: ");
-      Serial.println(error.f_str());
-      return;
+  StaticJsonDocument<1024> doc;
+  if (deserializeJson(doc, msg)) {
+    Serial.println("❌ JSON parse gagal!");
+    return;
+  }
+
+  const char* command = doc["command"];
+  const char* url = doc["mp3Url"];
+
+  if (command && String(command) == "ON") {
+    digitalWrite(LED_PIN, HIGH);
+    Serial.println("💡 LED ON");
+
+    if (url) {
+      lastUrl = String(url);
+      loopActive = true;
+      Serial.println("🔗 URL yang diputar: " + lastUrl);
+
+      safeDeleteAudio();
+      file = new AudioFileSourceHTTPStream(lastUrl.c_str());
+      buff = new AudioFileSourceBuffer(file, 2048);
+      mp3->begin(buff, out);
+      Serial.println("▶️ MP3 started (looping ON)");
     }
+  }
 
-    const char* command = doc["command"];
-    const char* url = doc["mp3Url"];
+  if (command && String(command) == "OFF") {
+    digitalWrite(LED_PIN, LOW);
+    Serial.println("💡 LED OFF");
 
-    if (command && String(command) == "ON") {
-      digitalWrite(LED_PIN, HIGH);
-      Serial.println("💡 LED ON");
-
-      if (url) {
-        lastUrl = String(url);   // simpan URL
-        loopActive = true;       // aktifkan loop
-
-        // safeDeleteAudio();   // ✅ bersihin dulu
-
-        if (mp3->isRunning()) mp3->stop();
-        file = new AudioFileSourceHTTPStream(lastUrl.c_str());
-        buff = new AudioFileSourceBuffer(file, 2048);
-        mp3->begin(buff, out);
-        Serial.println("▶️ MP3 started (looping ON)");
-      }
-    }
-
-    if (command && String(command) == "OFF") {
-      digitalWrite(LED_PIN, LOW);
-      Serial.println("💡 LED OFF");
-
-      loopActive = false;  // hentikan loop
-      // safeDeleteAudio();   // ✅ bersihin dulu
-      if (mp3->isRunning()) mp3->stop();
-    }
+    loopActive = false;
+    safeDeleteAudio();
   }
 }
 
 void loop() {
   client.loop();
 
+  // Update volume hanya saat MP3 jalan
   if (mp3->isRunning()) {
+    int potValue = adc1_get_raw(ADC1_CHANNEL_4);
+    float volume = (float)potValue / 4095.0;
+    out->SetGain(volume);
+
+    // MP3 looping
     if (!mp3->loop()) {
       mp3->stop();
       Serial.println("✅ Playback finished");
 
-      // Restart lagi kalau loop aktif
       if (loopActive && lastUrl != "") {
         Serial.println("🔁 Restarting playback...");
+        delay(50); // biar stack clear
+        safeDeleteAudio();
         file = new AudioFileSourceHTTPStream(lastUrl.c_str());
         buff = new AudioFileSourceBuffer(file, 2048);
         mp3->begin(buff, out);
       }
     }
   }
+
+  delay(1); // mencegah watchdog reset
 }

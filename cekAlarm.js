@@ -1,9 +1,9 @@
 const admin = require("firebase-admin");
 const mqtt = require("mqtt");
-const gTTS = require("google-tts-api"); // npm install google-tts-api
+const gTTS = require("google-tts-api");
 const fs = require("fs");
 const path = require("path");
-const axios = require("axios"); // npm install axios
+const axios = require("axios");
 const express = require("express");
 
 const serviceAccount = require("./pkm-medreminder-firebase-adminsdk-fbsvc-269f52353d.json");
@@ -29,6 +29,12 @@ let sudahDikirim = new Set();
 // === MQTT Connect ===
 client.on("connect", () => {
   console.log("📡 Terhubung ke MQTT broker.");
+
+  // subscribe supaya bisa dengerin OFF
+  client.subscribe("pkm/alarm", { qos: 1 }, (err) => {
+    if (err) console.error("❌ Gagal subscribe:", err);
+    else console.log("👂 Subscribed ke topic pkm/alarm");
+  });
 
   // Realtime listener untuk reminders
   db.collection("reminders").onSnapshot(async snapshot => {
@@ -57,13 +63,13 @@ client.on("connect", () => {
     console.log(`📥 Data reminders diperbarui. Jumlah: ${remindersData.length}`);
   });
 
-  // Listener statusIoT
+  // Listener statusIoT (Firestore → MQTT OFF)
   db.collection("reminders").onSnapshot(snapshot => {
     snapshot.docChanges().forEach(change => {
       if (change.type === "modified") {
         const data = change.doc.data();
         if (data.statusIoT === "OFF") {
-          const payload = JSON.stringify({ command: "OFF" });
+          const payload = JSON.stringify({ command: "OFF", docId: change.doc.id });
           client.publish("pkm/alarm", payload, { qos: 1 }, err => {
             if (err) console.error("❌ Gagal kirim MQTT OFF:", err);
             else console.log(`💡 MQTT OFF terkirim untuk reminder ${change.doc.id}`);
@@ -75,6 +81,29 @@ client.on("connect", () => {
 
   // Timer cek setiap detik
   setInterval(cekAlarm, 1000);
+});
+
+// === Listener pesan MQTT untuk hapus file MP3 saat OFF ===
+client.on("message", (topic, payload) => {
+  if (topic === "pkm/alarm") {
+    try {
+      const msg = JSON.parse(payload.toString());
+      if (msg.command === "OFF" && msg.docId) {
+        const filename = `${msg.docId}.mp3`;
+        const filePath = path.join(__dirname, "audio", filename);
+
+        fs.unlink(filePath, err => {
+          if (err) {
+            console.error(`❌ Gagal hapus file ${filename}:`, err.message);
+          } else {
+            console.log(`🗑️  File ${filename} berhasil dihapus`);
+          }
+        });
+      }
+    } catch (e) {
+      console.error("❌ Gagal parse MQTT:", e);
+    }
+  }
 });
 
 // === Fungsi generate & save MP3 ===
@@ -97,7 +126,7 @@ async function createTTSFile(text, filename) {
   response.data.pipe(writer);
 
   return new Promise((resolve, reject) => {
-    writer.on("finish", () => resolve(`http://192.168.1.2:3000/audio/${filename}`));
+    writer.on("finish", () => resolve(`http://192.168.1.4:3000/audio/${filename}`));
     writer.on("error", reject);
   });
 }
@@ -128,11 +157,12 @@ async function cekAlarm() {
       const filename = `${data.docId}.mp3`;
       const mp3Url = await createTTSFile(pesanText, filename);
 
-      // Kirim MQTT ke ESP
+      // Kirim MQTT ke ESP (bawa docId juga!)
       const payload = JSON.stringify({
         command: "ON",
         mp3Url,
         pesan: pesanText,
+        docId: data.docId
       });
 
       client.publish("pkm/alarm", payload, { qos: 1 }, async err => {
